@@ -106,3 +106,77 @@ def test_percentile():
     assert rm._percentile([1, 2, 3, 4, 5], 0.95) == 5
     assert rm._percentile([None, 2.0], 0.5) == 2.0
     assert rm._percentile([], 0.95) is None
+
+
+# ── cgroup readers (fake /sys/fs/cgroup trees) ────────────────
+
+_GIB = 1024**3
+
+
+def _write(root, rel, text):
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_cgroup_v1_docker_layout(tmp_path):
+    """Ubuntu 22.04 Docker with cgroupfs driver (partner laptop)."""
+    _write(tmp_path, "memory/memory.usage_in_bytes", str(3 * _GIB))
+    _write(tmp_path, "memory/memory.max_usage_in_bytes", str(4 * _GIB))
+    _write(tmp_path, "memory/memory.stat", f"cache {_GIB}\nrss 123\ntotal_rss {2 * _GIB}\n")
+    _write(tmp_path, "memory/memory.limit_in_bytes", str(6 * _GIB))
+    _write(tmp_path, "memory/memory.oom_control", "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n")
+    _write(tmp_path, "cpuacct/cpuacct.usage", "5000000000")  # 5 s in ns
+    _write(tmp_path, "cpu/cpu.cfs_quota_us", "200000")
+    _write(tmp_path, "cpu/cpu.cfs_period_us", "100000")
+    cg = rm.Cgroup(str(tmp_path))
+    assert cg.version == 1 and cg.available
+    assert cg.mem_bytes() == 3 * _GIB
+    assert cg.anon_bytes() == 2 * _GIB  # total_rss preferred over rss
+    assert cg.cpu_usec() == 5_000_000
+    assert cg.peak_bytes() == 4 * _GIB
+    assert cg.oom_kills() == 1
+    assert cg.limits() == {"cgroup_cpu_limit_cores": 2.0, "cgroup_mem_limit_mib": 6 * 1024.0}
+
+
+def test_cgroup_v1_unlimited_and_combined_cpu_dir(tmp_path):
+    _write(tmp_path, "memory/memory.usage_in_bytes", "100")
+    _write(tmp_path, "memory/memory.limit_in_bytes", "9223372036854771712")
+    _write(tmp_path, "cpu,cpuacct/cpuacct.usage", "1000")
+    _write(tmp_path, "cpu,cpuacct/cpu.cfs_quota_us", "-1")
+    _write(tmp_path, "cpu,cpuacct/cpu.cfs_period_us", "100000")
+    cg = rm.Cgroup(str(tmp_path))
+    assert cg.cpu_usec() == 1
+    assert cg.limits() == {"cgroup_cpu_limit_cores": None, "cgroup_mem_limit_mib": None}
+
+
+def test_cgroup_v2_layout(tmp_path):
+    _write(tmp_path, "memory.current", str(_GIB))
+    _write(tmp_path, "memory.peak", str(2 * _GIB))
+    _write(tmp_path, "memory.stat", f"anon {_GIB // 2}\nfile 10\n")
+    _write(tmp_path, "memory.events", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+    _write(tmp_path, "cpu.stat", "usage_usec 2500000\nuser_usec 2000000\n")
+    _write(tmp_path, "cpu.max", "150000 100000")
+    _write(tmp_path, "memory.max", "max")
+    cg = rm.Cgroup(str(tmp_path))
+    assert cg.version == 2
+    assert cg.anon_bytes() == _GIB // 2 and cg.cpu_usec() == 2_500_000
+    assert cg.peak_bytes() == 2 * _GIB and cg.oom_kills() == 0
+    assert cg.limits() == {"cgroup_cpu_limit_cores": 1.5, "cgroup_mem_limit_mib": None}
+
+
+def test_no_cgroup(tmp_path):
+    cg = rm.Cgroup(str(tmp_path))
+    assert cg.version is None and not cg.available
+
+
+def test_sampler_reads_cgroup(tmp_path):
+    _write(tmp_path, "memory/memory.usage_in_bytes", str(_GIB))
+    _write(tmp_path, "memory/memory.stat", f"total_rss {_GIB // 4}\n")
+    _write(tmp_path, "cpuacct/cpuacct.usage", "0")
+    sampler = rm.RankSampler(os.getpid(), cgroup=rm.Cgroup(str(tmp_path)))
+    sampler.sample()
+    _write(tmp_path, "cpuacct/cpuacct.usage", "1000000000")  # +1 s of CPU
+    row = sampler.sample()
+    assert row["cg_mem_mib"] == 1024.0 and row["cg_anon_mib"] == 256.0
+    assert row["cg_cpu_cores"] > 0

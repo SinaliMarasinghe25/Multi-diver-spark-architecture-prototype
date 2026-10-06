@@ -26,11 +26,13 @@
 #   cpu_cores    Δ(utime+stime of all tree processes) / Δwall  — core-equivalents
 #   rss_mib      Σ VmRSS of the tree (may double-count shared libraries)
 #   pss_mib      Σ Pss from smaps_rollup (shared pages split fairly; preferred)
-# Container (cgroup v2), when running inside Docker and the files exist:
-#   cg_mem_mib   memory.current (includes page cache)
-#   cg_anon_mib  anonymous memory from memory.stat (excludes page cache)
-#   cg_cpu_cores Δ cpu.stat usage_usec / Δwall
-#   limits       cpu.max and memory.max (the cap actually applied)
+# Container (cgroup v1 or v2), when running inside Docker:
+#   cg_mem_mib   container memory incl. page cache
+#   cg_anon_mib  anonymous memory (excludes page cache) — closest to demand
+#   cg_cpu_cores Δ container CPU usage / Δwall
+#   kernel peak  memory.max_usage_in_bytes (v1) / memory.peak (v2)
+#   limits       the CPU quota and memory limit actually applied
+#   OOM kills    container processes killed for exceeding the memory limit
 # Host context: cores, RAM, MemAvailable, load average and swap at start,
 # swap during the run (swapping invalidates timing comparisons).
 #
@@ -142,44 +144,109 @@ def _meminfo() -> dict[str, int]:
 
 
 # =============================================================================
-# cgroup v2 readers (Docker)
+# cgroup readers (Docker) — v1 (cgroupfs, e.g. Ubuntu 22.04 Docker) and v2
 # =============================================================================
 
-
-def _cg(name: str) -> str | None:
-    raw = _read(os.path.join(_CGROUP, name))
-    return raw.strip() if raw is not None else None
+_V1_UNLIMITED = 1 << 62  # v1 reports "no limit" as a huge number
 
 
-def cgroup_available() -> bool:
-    return os.path.exists(os.path.join(_CGROUP, "memory.current"))
+class Cgroup:
+    """
+    Read the container's own cgroup counters.  Inside a Docker container the
+    container's cgroup is mounted at /sys/fs/cgroup, so these are per-container
+    (= per-driver, one rank per container) values.
 
+    version 2: memory.current, memory.stat (anon), cpu.stat (usage_usec),
+               cpu.max, memory.max, memory.peak, memory.events (oom_kill)
+    version 1: memory/memory.usage_in_bytes, memory/memory.stat (total_rss),
+               cpuacct/cpuacct.usage (ns), cpu/cpu.cfs_quota_us + cfs_period_us,
+               memory/memory.limit_in_bytes, memory/memory.max_usage_in_bytes,
+               memory/memory.oom_control (oom_kill)
+    """
 
-def _cg_cpu_usec() -> int | None:
-    for line in (_cg("cpu.stat") or "").splitlines():
-        if line.startswith("usage_usec"):
-            return int(line.split()[1])
-    return None
+    def __init__(self, root: str = _CGROUP):
+        self.root = root
+        if os.path.exists(os.path.join(root, "memory.current")):
+            self.version = 2
+        elif os.path.exists(os.path.join(root, "memory", "memory.usage_in_bytes")):
+            self.version = 1
+        else:
+            self.version = None
 
+    @property
+    def available(self) -> bool:
+        return self.version is not None
 
-def _cg_anon_bytes() -> int | None:
-    for line in (_cg("memory.stat") or "").splitlines():
-        if line.startswith("anon "):
-            return int(line.split()[1])
-    return None
+    def _get(self, *candidates: str) -> str | None:
+        for rel in candidates:
+            raw = _read(os.path.join(self.root, rel))
+            if raw is not None:
+                return raw.strip()
+        return None
 
+    def _stat_value(self, rel: str, key: str) -> int | None:
+        for line in (self._get(rel) or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == key:
+                return int(parts[1])
+        return None
 
-def cgroup_limits() -> dict:
-    """Applied caps: cpu.max 'quota period' and memory.max (None = unlimited)."""
-    cpu_limit = mem_limit = None
-    cpu_max = _cg("cpu.max")
-    if cpu_max and not cpu_max.startswith("max"):
-        quota, period = cpu_max.split()
-        cpu_limit = int(quota) / int(period)
-    mem_max = _cg("memory.max")
-    if mem_max and mem_max != "max":
-        mem_limit = int(mem_max) / _MIB
-    return {"cgroup_cpu_limit_cores": cpu_limit, "cgroup_mem_limit_mib": mem_limit}
+    def mem_bytes(self) -> int | None:
+        """Current memory incl. page cache."""
+        raw = (
+            self._get("memory.current")
+            if self.version == 2
+            else self._get("memory/memory.usage_in_bytes")
+        )
+        return int(raw) if raw else None
+
+    def anon_bytes(self) -> int | None:
+        """Anonymous (non-cache) memory — closest to the driver's real demand."""
+        if self.version == 2:
+            return self._stat_value("memory.stat", "anon")
+        v = self._stat_value("memory/memory.stat", "total_rss")
+        return v if v is not None else self._stat_value("memory/memory.stat", "rss")
+
+    def cpu_usec(self) -> int | None:
+        if self.version == 2:
+            return self._stat_value("cpu.stat", "usage_usec")
+        raw = self._get("cpuacct/cpuacct.usage", "cpu,cpuacct/cpuacct.usage")
+        return int(raw) // 1000 if raw else None  # ns → µs
+
+    def peak_bytes(self) -> int | None:
+        """Kernel-recorded peak (catches spikes between samples), if exposed."""
+        raw = (
+            self._get("memory.peak")
+            if self.version == 2
+            else self._get("memory/memory.max_usage_in_bytes")
+        )
+        return int(raw) if raw and raw.isdigit() else None
+
+    def oom_kills(self) -> int | None:
+        if self.version == 2:
+            return self._stat_value("memory.events", "oom_kill")
+        return self._stat_value("memory/memory.oom_control", "oom_kill")
+
+    def limits(self) -> dict:
+        """Applied caps (None = unlimited)."""
+        cpu_limit = mem_limit = None
+        if self.version == 2:
+            cpu_max = self._get("cpu.max")
+            if cpu_max and not cpu_max.startswith("max"):
+                quota, period = cpu_max.split()
+                cpu_limit = int(quota) / int(period)
+            mem_max = self._get("memory.max")
+            if mem_max and mem_max != "max":
+                mem_limit = int(mem_max) / _MIB
+        elif self.version == 1:
+            quota = self._get("cpu/cpu.cfs_quota_us", "cpu,cpuacct/cpu.cfs_quota_us")
+            period = self._get("cpu/cpu.cfs_period_us", "cpu,cpuacct/cpu.cfs_period_us")
+            if quota and period and int(quota) > 0:
+                cpu_limit = int(quota) / int(period)
+            mem_max = self._get("memory/memory.limit_in_bytes")
+            if mem_max and int(mem_max) < _V1_UNLIMITED:
+                mem_limit = int(mem_max) / _MIB
+        return {"cgroup_cpu_limit_cores": cpu_limit, "cgroup_mem_limit_mib": mem_limit}
 
 
 # =============================================================================
@@ -190,13 +257,14 @@ def cgroup_limits() -> dict:
 class RankSampler:
     """Samples the process tree rooted at `root_pid` (and the cgroup, if any)."""
 
-    def __init__(self, root_pid: int, use_cgroup: bool | None = None):
+    def __init__(self, root_pid: int, cgroup: Cgroup | None = None):
         self.root_pid = root_pid
-        self.use_cgroup = cgroup_available() if use_cgroup is None else use_cgroup
+        self.cgroup = Cgroup() if cgroup is None else cgroup
+        self.use_cgroup = self.cgroup.available
         self.t0 = time.monotonic()
         self._last_t = self.t0
         self._last_ticks: dict[int, int] = {}
-        self._last_cg_usec = _cg_cpu_usec() if self.use_cgroup else None
+        self._last_cg_usec = self.cgroup.cpu_usec() if self.use_cgroup else None
         self.rows: list[dict] = []
 
     def sample(self) -> dict:
@@ -223,10 +291,10 @@ class RankSampler:
             "host_swap_used_mib": (mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) / _MIB,
         }
         if self.use_cgroup:
-            cur = _cg("memory.current")
-            anon = _cg_anon_bytes()
-            usec = _cg_cpu_usec()
-            row["cg_mem_mib"] = int(cur) / _MIB if cur else None
+            cur = self.cgroup.mem_bytes()
+            anon = self.cgroup.anon_bytes()
+            usec = self.cgroup.cpu_usec()
+            row["cg_mem_mib"] = cur / _MIB if cur is not None else None
             row["cg_anon_mib"] = anon / _MIB if anon is not None else None
             if not first and usec is not None and self._last_cg_usec is not None:
                 row["cg_cpu_cores"] = (usec - self._last_cg_usec) / 1e6 / dt
@@ -307,6 +375,7 @@ def run_monitored(command: list[str], out_dir: str, run_id: str, interval: float
         signal.signal(sig, _forward)
 
     sampler = RankSampler(proc.pid)
+    oom_before = sampler.cgroup.oom_kills() if sampler.use_cgroup else None
     sampler.sample()
     while proc.poll() is None:
         time.sleep(interval)
@@ -330,8 +399,16 @@ def run_monitored(command: list[str], out_dir: str, run_id: str, interval: float
         "start_unix": started,
         "duration_s": time.time() - started,
         "interval_s": interval,
-        "cgroup": sampler.use_cgroup,
-        **(cgroup_limits() if sampler.use_cgroup else {}),
+        "cgroup_version": sampler.cgroup.version,
+        **(sampler.cgroup.limits() if sampler.use_cgroup else {}),
+        "cg_mem_kernel_peak_mib": (
+            peak / _MIB if sampler.use_cgroup and (peak := sampler.cgroup.peak_bytes()) else None
+        ),
+        "cg_oom_kills": (
+            (sampler.cgroup.oom_kills() or 0) - (oom_before or 0)
+            if oom_before is not None
+            else None
+        ),
         **context,
         **summarise(sampler.rows),
     }
