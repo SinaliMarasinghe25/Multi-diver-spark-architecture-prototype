@@ -139,14 +139,14 @@ def test_training_script_end_to_end(tmp_path, monkeypatch):
 
     out = tmp_path / "models"
     metrics = trp.main(["--drivers", str(path), "--out-dir", str(out)])
-    assert set(metrics["model"]) == {"lookup", "ridge", "rf"}
+    assert set(metrics["model"]) == {"lookup", "ridge", "ridge_wl", "rf"}
     assert set(metrics["target"]) == set(m.TARGETS)
     card = json.loads((out / "model_card.json").read_text())
     assert card["rows"]["rows_dropped_unknown_alloc"] == 2
     assert card["rows"]["workloads_dropped_entirely"] == ["wordcount"]
     assert (out / "mem_mb_peak__rf.joblib").exists()
     cv = pd.read_csv(out / "cv_metrics.csv")
-    assert set(cv["model"]) == {"lookup", "ridge", "rf"}
+    assert set(cv["model"]) == {"lookup", "ridge", "ridge_wl", "rf"}
     sel = card["choices"]["mem_mb_peak"]["selected"]
     assert sel["ridge"].startswith("ridge|") and sel["rf"].startswith("rf|")
     assert "mae_diff_ci95" in card["choices"]["mem_mb_peak"]["cv_uncertainty"]["rf"]
@@ -187,3 +187,47 @@ def test_group_bootstrap_interval_and_paired_difference():
     assert res["n_groups"] == df["config_group"].nunique()
     # linear signal: ridge must beat the coarse lookup clearly
     assert res["mae_diff_vs_baseline"] < 0 and res["mae_diff_ci95"][1] < 0
+
+
+# ── per-workload Ridge ────────────────────────────────────────
+
+
+def _slopes_differ(n=4, seed=3):
+    """Memory rises with heap for logreg only; flat for kmeans."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for wl, slope in (("kmeans", 0.0), ("logreg", 0.8)):
+        for heap in (1024, 2048, 3072, 4096, 6144):
+            for cores in (2, 4):
+                for _ in range(n):
+                    rows.append(
+                        {
+                            "workload_type": wl,
+                            "dataset_mb": 100,
+                            "num_workers": 2,
+                            "cores_per_driver": cores,
+                            "heap_mb_per_driver": heap,
+                            "mem_mb_peak": 1000 + slope * heap + rng.normal(0, 20),
+                        }
+                    )
+    return pd.DataFrame(rows)
+
+
+def test_workload_interactions_shape_and_training_stats():
+    df = _slopes_differ()
+    t = m.WorkloadInteractions().fit(df[m.FEATURES])
+    out = t.transform(df[m.FEATURES])
+    k, p = 2, len(m.NUMERIC_FEATURES)
+    assert out.shape == (len(df), k + p + k * p)
+    assert t.std_[m.NUMERIC_FEATURES.index("num_workers")] == 1.0  # constant column
+    unseen = t.transform(df[m.FEATURES].assign(workload_type="wordcount").iloc[:3])
+    assert np.all(unseen[:, :k] == 0) and np.all(unseen[:, k + p :] == 0)
+
+
+def test_ridge_wl_captures_per_workload_slopes():
+    df = _slopes_differ()
+    shared = m.make_ridge(0.1).fit(df[m.FEATURES], df["mem_mb_peak"])
+    per_wl = m.make_ridge_wl(0.1).fit(df[m.FEATURES], df["mem_mb_peak"])
+    mae_shared = m.regression_metrics(df["mem_mb_peak"], shared.predict(df[m.FEATURES]))["mae"]
+    mae_wl = m.regression_metrics(df["mem_mb_peak"], per_wl.predict(df[m.FEATURES]))["mae"]
+    assert mae_wl < 0.5 * mae_shared

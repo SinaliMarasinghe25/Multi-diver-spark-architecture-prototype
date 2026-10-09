@@ -6,6 +6,7 @@
 # STAGE 1 — local-only baselines
 # ------------------------------
 # For each target (cpu_cores_mean, cpu_cores_p95, mem_mb_peak) this script:
+#   Models: lookup, ridge (shared slopes), ridge_wl (per-workload slopes), rf.
 #   1. runs leave-one-configuration-out CV on TRAIN+VAL: every configuration
 #      group is predicted by models trained on all other groups,
 #   2. picks Ridge alpha and RF depth/leaf size by CV MAE,
@@ -114,6 +115,7 @@ def select_and_train(
     # ── selection by leave-one-configuration-out CV on TRAIN+VAL ──────────
     candidates = {"lookup": m.LookupModel}
     candidates |= {f"ridge|{a}": (lambda a=a: m.make_ridge(a)) for a in m.RIDGE_ALPHAS}
+    candidates |= {f"ridge_wl|{a}": (lambda a=a: m.make_ridge_wl(a)) for a in m.RIDGE_ALPHAS}
     candidates |= {
         f"rf|{p['max_depth']}|{p['min_samples_leaf']}": (lambda p=p: m.make_rf(**p))
         for p in m.RF_GRID
@@ -126,7 +128,7 @@ def select_and_train(
     )
     best = {
         family: cand_mae[[c for c in cand_mae.index if c.split("|")[0] == family]].idxmin()
-        for family in ("lookup", "ridge", "rf")
+        for family in ("lookup", "ridge", "ridge_wl", "rf")
     }
     factories = {family: candidates[key] for family, key in best.items()}
     oof = oof_all[oof_all["model"].isin(best.values())].replace(
@@ -137,6 +139,8 @@ def select_and_train(
         name: m.group_bootstrap(oof, name, baseline=None if name == "lookup" else "lookup")
         for name in factories
     }
+    # does a per-workload slope improve on the shared-slope Ridge?
+    uncertainty["ridge_wl_vs_ridge"] = m.group_bootstrap(oof, "ridge_wl", baseline="ridge")
 
     rows, preds, fitted = [], [], {}
     for name, factory in factories.items():
@@ -249,13 +253,13 @@ def main(argv=None):
     for target, ch in card_targets.items():
         for name, u in ch["cv_uncertainty"].items():
             diff = (
-                f"  diff vs lookup {u['mae_diff_vs_baseline']:+.3f} "
+                f"  diff vs {u['baseline']} {u['mae_diff_vs_baseline']:+.3f} "
                 f"[{u['mae_diff_ci95'][0]:+.3f}, {u['mae_diff_ci95'][1]:+.3f}]"
                 if "baseline" in u
                 else ""
             )
             print(
-                f"   {target:15s} {name:6s} MAE {u['mae']:.3f} "
+                f"   {target:15s} {name:17s} MAE {u['mae']:.3f} "
                 f"[{u['mae_ci95'][0]:.3f}, {u['mae_ci95'][1]:.3f}]{diff}"
             )
     print("── final evaluation on TEST ──")

@@ -12,7 +12,8 @@
 # Models (one per target; CPU and memory are trained separately):
 #   lookup  median of the most specific matching configuration seen in
 #           training, falling back to coarser matches  (baseline)
-#   ridge   regularised linear regression on scaled / one-hot features
+#   ridge     regularised linear regression on scaled / one-hot features
+#   ridge_wl  the same with a separate slope per workload (interactions)
 #   rf      small random forest (non-linear comparator)
 #
 # Preprocessing lives inside each scikit-learn Pipeline, so scaling and
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
@@ -113,6 +115,48 @@ def make_rf(
     return Pipeline([("pre", pre), ("model", rf)])
 
 
+class WorkloadInteractions(BaseEstimator, TransformerMixin):
+    """
+    Features for a per-workload linear model:
+        [ one-hot workload | z(numeric) | one-hot workload × z(numeric) ]
+    where z() standardises log2(dataset_mb), log2(heap) and the raw counts with
+    the TRAINING mean/std.  The interaction block gives every workload its own
+    slope for each input, so Ridge is no longer forced to share one slope
+    across K-Means and LogReg.  An unseen workload gets an all-zero one-hot
+    (shared slopes only).
+    """
+
+    _LOG = ("dataset_mb", "heap_mb_per_driver")
+
+    def _numeric(self, X: pd.DataFrame) -> np.ndarray:
+        cols = [
+            np.log2(X[c].to_numpy(float)) if c in self._LOG else X[c].to_numpy(float)
+            for c in NUMERIC_FEATURES
+        ]
+        return np.column_stack(cols)
+
+    def fit(self, X: pd.DataFrame, y=None):
+        self.workloads_ = sorted(X["workload_type"].unique())
+        num = self._numeric(X)
+        self.mean_ = num.mean(axis=0)
+        std = num.std(axis=0)
+        self.std_ = np.where(std > 0, std, 1.0)  # constant columns (e.g. workers)
+        return self
+
+    def transform(self, X: pd.DataFrame) -> np.ndarray:
+        z = (self._numeric(X) - self.mean_) / self.std_
+        onehot = np.column_stack(
+            [(X["workload_type"] == w).to_numpy(float) for w in self.workloads_]
+        )
+        inter = np.column_stack([onehot[:, [i]] * z for i in range(onehot.shape[1])])
+        return np.hstack([onehot, z, inter])
+
+
+def make_ridge_wl(alpha: float = 1.0) -> Pipeline:
+    """Ridge with per-workload slopes (see WorkloadInteractions)."""
+    return Pipeline([("pre", WorkloadInteractions()), ("model", Ridge(alpha=alpha))])
+
+
 class LookupModel:
     """
     Median of the training rows that share the most specific configuration
@@ -185,6 +229,7 @@ def upper_margin(y_true, y_pred, quantile: float = 0.9) -> float:
 CV_FACTORIES = {
     "lookup": LookupModel,
     "ridge": lambda: make_ridge(1.0),
+    "ridge_wl": lambda: make_ridge_wl(1.0),
     "rf": lambda: make_rf(5, 2),
 }
 
