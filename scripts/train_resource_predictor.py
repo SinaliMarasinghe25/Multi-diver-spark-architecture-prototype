@@ -6,15 +6,18 @@
 # STAGE 1 — local-only baselines
 # ------------------------------
 # For each target (cpu_cores_mean, cpu_cores_p95, mem_mb_peak) this script:
-#   1. fits lookup / Ridge / Random Forest on the TRAIN split,
-#   2. picks Ridge alpha and RF depth/leaf size on the VAL split (MAE),
-#   3. calibrates an empirical upper margin from VAL residuals,
-#   4. refits the chosen models on TRAIN+VAL,
-#   5. evaluates ONCE on the held-out TEST split (overall and per workload).
+#   1. runs leave-one-configuration-out CV on TRAIN+VAL: every configuration
+#      group is predicted by models trained on all other groups,
+#   2. picks Ridge alpha and RF depth/leaf size by CV MAE,
+#   3. reports CV errors with 95 % group-bootstrap intervals and paired
+#      differences against the lookup baseline,
+#   4. calibrates the empirical upper margin from out-of-fold residuals,
+#   5. refits the chosen models on TRAIN+VAL and evaluates ONCE on TEST.
 #
 # Input:  data/local/local_drivers.csv  (scripts/build_local_dataset.py)
 # Output: data/models/local/  (git-ignored)
 #   metrics.csv          test metrics per target × model × workload
+#   cv_metrics.csv       out-of-fold CV metrics per target × model × workload
 #   predictions_test.csv per-row test predictions and upper bounds
 #   <target>__<model>.joblib   fitted models (refit on train+val)
 #   model_card.json      data, features, ranges, choices, versions
@@ -82,39 +85,64 @@ def _fit_predict(model, train, test, target):
     return model, model.predict(test[m.FEATURES])
 
 
-def select_and_train(df: pd.DataFrame, target: str, q: float) -> tuple[list[dict], list, dict]:
-    """Return (metric rows, prediction frames, choices) for one target."""
+def _cv_rows(oof: pd.DataFrame, target: str) -> list[dict]:
+    """Pooled out-of-fold metrics per model, overall and per workload."""
+    rows = []
+    for name, g in oof.groupby("model"):
+        for wl, gw in [("all", g)] + list(g.groupby("workload_type")):
+            rows.append(
+                {
+                    "target": target,
+                    "unit": m.TARGETS[target],
+                    "model": name,
+                    "workload": wl,
+                    "n_groups": int(gw["config_group"].nunique()),
+                    **m.regression_metrics(gw["actual"], gw["predicted"]),
+                }
+            )
+    return rows
+
+
+def select_and_train(
+    df: pd.DataFrame, target: str, q: float
+) -> tuple[list[dict], list[dict], list, dict]:
+    """Return (test metric rows, CV metric rows, test prediction frames, choices)."""
     d = df[df[target].notna()]
-    train, val, test = (d[d["split"] == s] for s in ("train", "val", "test"))
-    trval = pd.concat([train, val])
+    trval = d[d["split"].isin(["train", "val"])]
+    test = d[d["split"] == "test"]
 
-    # ── selection on validation ──────────────────────────────────────────
-    ridge_scores = {
-        a: m.regression_metrics(val[target], _fit_predict(m.make_ridge(a), train, val, target)[1])[
-            "mae"
-        ]
-        for a in m.RIDGE_ALPHAS
+    # ── selection by leave-one-configuration-out CV on TRAIN+VAL ──────────
+    candidates = {"lookup": m.LookupModel}
+    candidates |= {f"ridge|{a}": (lambda a=a: m.make_ridge(a)) for a in m.RIDGE_ALPHAS}
+    candidates |= {
+        f"rf|{p['max_depth']}|{p['min_samples_leaf']}": (lambda p=p: m.make_rf(**p))
+        for p in m.RF_GRID
     }
-    best_alpha = min(ridge_scores, key=ridge_scores.get)
-    rf_scores = {
-        i: m.regression_metrics(val[target], _fit_predict(m.make_rf(**p), train, val, target)[1])[
-            "mae"
-        ]
-        for i, p in enumerate(m.RF_GRID)
+    oof_all = m.group_cv_predictions(trval, target, candidates)
+    cand_mae = (
+        oof_all.assign(ae=(oof_all["predicted"] - oof_all["actual"]).abs())
+        .groupby("model")["ae"]
+        .mean()
+    )
+    best = {
+        family: cand_mae[[c for c in cand_mae.index if c.split("|")[0] == family]].idxmin()
+        for family in ("lookup", "ridge", "rf")
     }
-    best_rf = m.RF_GRID[min(rf_scores, key=rf_scores.get)]
-
-    factories = {
-        "lookup": m.LookupModel,
-        "ridge": lambda: m.make_ridge(best_alpha),
-        "rf": lambda: m.make_rf(**best_rf),
+    factories = {family: candidates[key] for family, key in best.items()}
+    oof = oof_all[oof_all["model"].isin(best.values())].replace(
+        {"model": {v: k for k, v in best.items()}}
+    )
+    cv_rows = _cv_rows(oof, target)
+    uncertainty = {
+        name: m.group_bootstrap(oof, name, baseline=None if name == "lookup" else "lookup")
+        for name in factories
     }
 
     rows, preds, fitted = [], [], {}
     for name, factory in factories.items():
-        # upper margin from validation residuals of a TRAIN-only fit
-        _, val_pred = _fit_predict(factory(), train, val, target)
-        margin = m.upper_margin(val[target], val_pred, q)
+        # upper margin from out-of-fold residuals of the selected configuration
+        sel = oof[oof["model"] == name]
+        margin = m.upper_margin(sel["actual"], sel["predicted"], q)
         # final model on TRAIN+VAL, evaluated once on TEST
         model, test_pred = _fit_predict(factory(), trval, test, target)
         upper = test_pred + margin
@@ -141,16 +169,16 @@ def select_and_train(df: pd.DataFrame, target: str, q: float) -> tuple[list[dict
         preds.append(p)
 
     choices = {
-        "ridge_alpha": best_alpha,
-        "ridge_val_mae": ridge_scores,
-        "rf_params": best_rf,
-        "rf_val_mae": {str(m.RF_GRID[i]): s for i, s in rf_scores.items()},
-        "n_train": len(train),
-        "n_val": len(val),
-        "n_test": len(test),
+        "selected": best,
+        "cv_mae_by_candidate": cand_mae.round(4).to_dict(),
+        "cv_uncertainty": uncertainty,
+        "n_trainval_rows": len(trval),
+        "n_trainval_groups": int(trval["config_group"].nunique()),
+        "n_test_rows": len(test),
+        "n_test_groups": int(test["config_group"].nunique()),
         "fitted": fitted,
     }
-    return rows, preds, choices
+    return rows, cv_rows, preds, choices
 
 
 def main(argv=None):
@@ -158,10 +186,11 @@ def main(argv=None):
     df, info = load_training_rows(args.drivers)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    all_rows, all_preds, card_targets = [], [], {}
+    all_rows, all_cv, all_preds, card_targets = [], [], [], {}
     for target in m.TARGETS:
-        rows, preds, choices = select_and_train(df, target, args.upper_quantile)
+        rows, cv_rows, preds, choices = select_and_train(df, target, args.upper_quantile)
         all_rows += rows
+        all_cv += cv_rows
         all_preds += preds
         for name, model in choices.pop("fitted").items():
             joblib.dump(model, os.path.join(args.out_dir, f"{target}__{name}.joblib"))
@@ -169,12 +198,15 @@ def main(argv=None):
 
     metrics = pd.DataFrame(all_rows)
     metrics.to_csv(os.path.join(args.out_dir, "metrics.csv"), index=False)
+    cv_metrics = pd.DataFrame(all_cv)
+    cv_metrics.to_csv(os.path.join(args.out_dir, "cv_metrics.csv"), index=False)
     pd.concat(all_preds).to_csv(os.path.join(args.out_dir, "predictions_test.csv"), index=False)
 
     with open(args.drivers, "rb") as fh:
         data_sha = hashlib.sha256(fh.read()).hexdigest()
     card = {
         "stage": "local_only_baselines",
+        "protocol": "leave-one-configuration-out CV on train+val for selection, upper-margin calibration and uncertainty; single final evaluation on test",
         "data": {"drivers_csv": os.path.relpath(args.drivers, _PROJECT_ROOT), "sha256": data_sha},
         "rows": info,
         "features": m.FEATURES,
@@ -209,6 +241,24 @@ def main(argv=None):
         ]
     ]
     print(f"[train] rows used: {info}")
+    cv_show = cv_metrics[cv_metrics["workload"] == "all"][
+        ["target", "unit", "model", "n_groups", "mae", "mape_pct", "underprediction_rate"]
+    ]
+    print("── leave-one-configuration-out CV (train+val) ──")
+    print(cv_show.round(3).to_string(index=False))
+    for target, ch in card_targets.items():
+        for name, u in ch["cv_uncertainty"].items():
+            diff = (
+                f"  diff vs lookup {u['mae_diff_vs_baseline']:+.3f} "
+                f"[{u['mae_diff_ci95'][0]:+.3f}, {u['mae_diff_ci95'][1]:+.3f}]"
+                if "baseline" in u
+                else ""
+            )
+            print(
+                f"   {target:15s} {name:6s} MAE {u['mae']:.3f} "
+                f"[{u['mae_ci95'][0]:.3f}, {u['mae_ci95'][1]:.3f}]{diff}"
+            )
+    print("── final evaluation on TEST ──")
     print(show.round(3).to_string(index=False))
     print(f"[train] outputs written to {args.out_dir}")
     return metrics

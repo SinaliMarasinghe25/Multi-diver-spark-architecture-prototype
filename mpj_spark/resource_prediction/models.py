@@ -95,18 +95,20 @@ def make_ridge(alpha: float = 1.0) -> Pipeline:
     return Pipeline([("pre", pre), ("model", Ridge(alpha=alpha))])
 
 
-def make_rf(max_depth: int = 5, min_samples_leaf: int = 2, seed: int = 0) -> Pipeline:
+def make_rf(
+    max_depth: int = 5, min_samples_leaf: int = 2, seed: int = 0, n_estimators: int = 200
+) -> Pipeline:
     """Small random forest; trees need no scaling, only the one-hot workload."""
     pre = ColumnTransformer(
         [("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_FEATURES)],
         remainder="passthrough",
     )
     rf = RandomForestRegressor(
-        n_estimators=200,
+        n_estimators=n_estimators,
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
         random_state=seed,
-        n_jobs=1,
+        n_jobs=-1,
     )
     return Pipeline([("pre", pre), ("model", rf)])
 
@@ -173,3 +175,96 @@ def upper_margin(y_true, y_pred, quantile: float = 0.9) -> float:
     """Additive margin so that `pred + margin` covers `quantile` of residuals."""
     resid = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
     return float(max(np.quantile(resid, quantile), 0.0))
+
+
+# =============================================================================
+# Leave-one-configuration-out cross-validation (train+val only; test untouched)
+# =============================================================================
+
+# Fixed hyper-parameters for CV so the CV estimate is not tuned on its own folds.
+CV_FACTORIES = {
+    "lookup": LookupModel,
+    "ridge": lambda: make_ridge(1.0),
+    "rf": lambda: make_rf(5, 2),
+}
+
+
+def group_cv_predictions(
+    df: pd.DataFrame, target: str, factories: dict | None = None, group_col: str = "config_group"
+) -> pd.DataFrame:
+    """
+    Out-of-fold predictions: each configuration group is predicted by a model
+    trained on all OTHER groups, so repeats of the held-out configuration are
+    never seen in training.  Returns one row per (input row, model).
+    """
+    factories = CV_FACTORIES if factories is None else factories
+    d = df[df[target].notna()]
+    frames = []
+    for group in d[group_col].unique():
+        held = d[d[group_col] == group]
+        rest = d[d[group_col] != group]
+        for name, factory in factories.items():
+            model = factory().fit(rest[FEATURES], rest[target])
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "row": held.index,
+                        group_col: group,
+                        "workload_type": held["workload_type"].values,
+                        "model": name,
+                        "actual": held[target].values,
+                        "predicted": model.predict(held[FEATURES]),
+                    }
+                )
+            )
+    return pd.concat(frames, ignore_index=True)
+
+
+def group_bootstrap(
+    oof: pd.DataFrame,
+    model: str,
+    baseline: str | None = None,
+    n_boot: int = 2000,
+    seed: int = 0,
+    group_col: str = "config_group",
+) -> dict:
+    """
+    95 % bootstrap interval of MAE by resampling configuration GROUPS (the
+    independent unit).  With `baseline`, also the paired MAE difference
+    model − baseline on the same resampled groups (negative = model better).
+    """
+    rng = np.random.default_rng(seed)
+
+    def per_group_abs(name):
+        s = oof[oof["model"] == name]
+        return (
+            s.assign(ae=(s["predicted"] - s["actual"]).abs())
+            .groupby(group_col)["ae"]
+            .agg(["sum", "count"])
+        )
+
+    a = per_group_abs(model)
+    groups = a.index.to_numpy()
+    b = per_group_abs(baseline).reindex(groups) if baseline else None
+    maes, diffs = [], []
+    for _ in range(n_boot):
+        pick = rng.choice(groups, size=len(groups), replace=True)
+        sa = a.loc[pick]
+        mae = sa["sum"].sum() / sa["count"].sum()
+        maes.append(mae)
+        if b is not None:
+            sb = b.loc[pick]
+            diffs.append(mae - sb["sum"].sum() / sb["count"].sum())
+    out = {
+        "mae": float(a["sum"].sum() / a["count"].sum()),
+        "mae_ci95": [float(np.percentile(maes, 2.5)), float(np.percentile(maes, 97.5))],
+        "n_groups": int(len(groups)),
+    }
+    if b is not None:
+        point = out["mae"] - float(b["sum"].sum() / b["count"].sum())
+        out |= {
+            "baseline": baseline,
+            "mae_diff_vs_baseline": point,
+            "mae_diff_ci95": [float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))],
+        }
+    return out

@@ -113,9 +113,15 @@ def test_upper_margin_covers_quantile():
 # ── training script end-to-end ────────────────────────────────
 
 
-def test_training_script_end_to_end(tmp_path):
+def test_training_script_end_to_end(tmp_path, monkeypatch):
     sys.path.insert(0, os.path.abspath(_SCRIPTS))
     import train_resource_predictor as trp
+
+    # keep the CV grid small so the test stays fast
+    monkeypatch.setattr(m, "RIDGE_ALPHAS", [1.0, 10.0])
+    monkeypatch.setattr(m, "RF_GRID", [{"max_depth": 3, "min_samples_leaf": 2}])
+    full_rf = m.make_rf
+    monkeypatch.setattr(m, "make_rf", lambda **kw: full_rf(n_estimators=10, **kw))
 
     df = _frame(n_per_group=2)
     df["config_group"] = df[m.FEATURES].astype(str).agg("|".join, axis=1)
@@ -139,6 +145,45 @@ def test_training_script_end_to_end(tmp_path):
     assert card["rows"]["rows_dropped_unknown_alloc"] == 2
     assert card["rows"]["workloads_dropped_entirely"] == ["wordcount"]
     assert (out / "mem_mb_peak__rf.joblib").exists()
+    cv = pd.read_csv(out / "cv_metrics.csv")
+    assert set(cv["model"]) == {"lookup", "ridge", "rf"}
+    sel = card["choices"]["mem_mb_peak"]["selected"]
+    assert sel["ridge"].startswith("ridge|") and sel["rf"].startswith("rf|")
+    assert "mae_diff_ci95" in card["choices"]["mem_mb_peak"]["cv_uncertainty"]["rf"]
     preds = pd.read_csv(out / "predictions_test.csv")
     test_keys = set(df.loc[df["split"] == "test", "run_key"])
     assert set(preds["run_key"].astype(str)) == test_keys  # only TEST rows scored
+
+
+# ── group cross-validation ────────────────────────────────────
+
+
+def _grouped(df):
+    df = df.copy()
+    df["config_group"] = df[m.FEATURES].astype(str).agg("|".join, axis=1)
+    return df
+
+
+def test_group_cv_never_trains_on_held_out_configuration():
+    df = _grouped(_frame(n_per_group=2))
+    oof = m.group_cv_predictions(df, "cpu_cores_mean", {"lookup": m.LookupModel})
+    assert len(oof) == len(df)  # every row predicted exactly once
+    # lookup can never hit the exact configuration (level 0): it was held out
+    for group, held in df.groupby("config_group"):
+        rest = df[df["config_group"] != group]
+        lk = m.LookupModel().fit(rest[m.FEATURES], rest["cpu_cores_mean"])
+        lk.predict(held)
+        assert (lk.level_used_ > 0).all()
+
+
+def test_group_bootstrap_interval_and_paired_difference():
+    df = _grouped(_frame(n_per_group=2))
+    oof = m.group_cv_predictions(
+        df, "mem_mb_peak", {"lookup": m.LookupModel, "ridge": lambda: m.make_ridge(1.0)}
+    )
+    res = m.group_bootstrap(oof, "ridge", baseline="lookup", n_boot=300)
+    lo, hi = res["mae_ci95"]
+    assert lo <= res["mae"] <= hi
+    assert res["n_groups"] == df["config_group"].nunique()
+    # linear signal: ridge must beat the coarse lookup clearly
+    assert res["mae_diff_vs_baseline"] < 0 and res["mae_diff_ci95"][1] < 0
