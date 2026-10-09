@@ -147,10 +147,87 @@ def test_build_script_end_to_end(raw_dir, tmp_path):
     import build_local_dataset
 
     out = tmp_path / "out"
-    build_local_dataset.main(["--raw-dir", str(raw_dir), "--out-dir", str(out)])
+    splits = tmp_path / "splits.json"  # never touch the real config file
+    build_local_dataset.main(
+        ["--raw-dir", str(raw_dir), "--out-dir", str(out), "--splits-file", str(splits)]
+    )
     report = json.loads((out / "build_report.json").read_text())
     assert report["runs_by_status"] == {"ok": 19, "timeout": 2}
     assert report["config_groups_spanning_splits"] == 0
     drivers = pd.read_csv(out / "local_drivers.csv")
     assert {"cpu_cores_p95", "mem_mb_peak", "cores_per_driver"} <= set(drivers.columns)
     assert not any(c.startswith(("sys_", "pss_")) for c in drivers.columns)
+
+
+# ── adding new result files safely ────────────────────────────
+
+
+def test_duplicate_file_copy_counts_once(raw_dir):
+    before, _, _ = ld.build_tables(str(raw_dir))
+    (raw_dir / "grid_kmeans100 (1).csv").write_text((raw_dir / "grid_kmeans100.csv").read_text())
+    after, _, report = ld.build_tables(str(raw_dir))
+    assert len(after) == len(before)
+    assert report["duplicate_rows_dropped"] > 0
+    assert report["files_with_duplicate_rows"]
+
+
+def test_reruns_with_new_timestamp_are_not_duplicates(raw_dir):
+    before, _, _ = ld.build_tables(str(raw_dir))
+    rerun = (raw_dir / "grid_kmeans100.csv").read_text().replace("2026-10-08", "2026-10-11")
+    (raw_dir / "grid_kmeans100_rerun.csv").write_text(rerun)
+    after, _, report = ld.build_tables(str(raw_dir))
+    assert report["duplicate_rows_dropped"] == 0
+    assert len(after) == 2 * len(before[before["file"] == "grid_kmeans100.csv"]) + len(
+        before[before["file"] != "grid_kmeans100.csv"]
+    )
+
+
+def test_frozen_splits_survive_new_configurations(raw_dir):
+    _, runs, report = ld.build_tables(str(raw_dir))
+    frozen = report["split_map"]
+    # add a brand-new configuration group in a new file
+    new_rows = _new_run("kmeans", 100, 3, 1024, 1) + _new_run("kmeans", 100, 3, 1024, 2)
+    _write(raw_dir / "grid_kmeans100_extra.csv", _NEW_COLS, new_rows)
+    _, runs2, report2 = ld.build_tables(str(raw_dir), frozen)
+    assert report2["split_groups_kept_from_file"] == len(frozen)
+    assert report2["split_groups_newly_assigned"] == 1
+    old = runs.set_index("run_key")["split"]
+    new = runs2.set_index("run_key")["split"].reindex(old.index)
+    assert (old == new).all()  # nothing moved
+
+
+def test_frozen_split_wins_over_recomputed_split(raw_dir):
+    _, _, report = ld.build_tables(str(raw_dir))
+    group = next(iter(report["split_map"]))
+    forced = {g: "train" for g in report["split_map"]} | {group: "test"}
+    _, runs, _ = ld.build_tables(str(raw_dir), forced)
+    assert set(runs.loc[runs["config_group"] == group, "split"]) == {"test"}
+
+
+def test_small_stratum_uses_hash_split_not_all_train():
+    groups = pd.DataFrame({"config_group": [f"x|{i}" for i in range(2)], "stratum": ["x"] * 2})
+    split = ld.stratified_split(groups)
+    assert split == {k: ld._hash_split(k) for k in split}
+
+
+def test_build_script_saves_and_reuses_splits(raw_dir, tmp_path):
+    sys.path.insert(0, os.path.abspath(_SCRIPTS))
+    import build_local_dataset
+
+    out = tmp_path / "out2"
+    args = ["--raw-dir", str(raw_dir), "--out-dir", str(out), "--splits-file", str(out / "s.json")]
+    build_local_dataset.main(args)
+    first = json.loads((out / "s.json").read_text())["groups"]
+    rep = build_local_dataset.main(args)
+    assert rep["split_groups_kept_from_file"] == len(first)
+    assert rep["split_groups_newly_assigned"] == 0
+    assert "split_map" not in json.loads((out / "build_report.json").read_text())
+
+
+def test_default_split_file_is_version_controlled_path():
+    sys.path.insert(0, os.path.abspath(_SCRIPTS))
+    import build_local_dataset
+
+    assert build_local_dataset.DEFAULT_SPLITS_FILE.endswith(
+        os.path.join("config", "phase6_splits.json")
+    )

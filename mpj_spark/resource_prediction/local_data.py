@@ -173,13 +173,23 @@ def config_group(row) -> str:
     )
 
 
+def _hash_split(key: str, fractions: dict[str, float] = SPLIT_FRACTIONS) -> str:
+    """Per-group hash split used when a stratum has too few groups to stratify."""
+    h = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    if h < fractions["test"]:
+        return "test"
+    if h < fractions["test"] + fractions["val"]:
+        return "val"
+    return "train"
+
+
 def stratified_split(groups: pd.DataFrame, fractions: dict[str, float] = SPLIT_FRACTIONS) -> dict:
     """
     {config_group: split}, stratified by workload so every workload appears in
     val and test (a plain hash split leaves some workloads out when there are
     only a few dozen groups).  Groups are ordered by a hash of their key, so
     the split is deterministic and does not depend on file order.
-    Workloads with fewer than 3 groups go entirely to train.
+    Strata with fewer than 3 groups fall back to a per-group hash split.
     """
     out = {}
     for _, g in groups.groupby("stratum"):
@@ -187,10 +197,26 @@ def stratified_split(groups: pd.DataFrame, fractions: dict[str, float] = SPLIT_F
             g["config_group"].unique(), key=lambda k: hashlib.sha256(k.encode()).hexdigest()
         )
         n = len(keys)
-        n_test = max(1, round(n * fractions["test"])) if n >= 3 else 0
-        n_val = max(1, round(n * fractions["val"])) if n >= 3 else 0
+        if n < 3:
+            out.update({k: _hash_split(k, fractions) for k in keys})
+            continue
+        n_test = max(1, round(n * fractions["test"]))
+        n_val = max(1, round(n * fractions["val"]))
         for i, key in enumerate(keys):
             out[key] = "test" if i < n_test else "val" if i < n_test + n_val else "train"
+    return out
+
+
+def assign_splits(groups: pd.DataFrame, frozen: dict[str, str] | None = None) -> dict[str, str]:
+    """
+    Keep every group already recorded in `frozen` in its original split and
+    split only the NEW groups (stratified among themselves).  This keeps the
+    held-out test set fixed when new result files are added.
+    """
+    frozen = frozen or {}
+    new = groups[~groups["config_group"].isin(frozen)]
+    out = {g: frozen[g] for g in groups["config_group"] if g in frozen}
+    out.update(stratified_split(new) if len(new) else {})
     return out
 
 
@@ -207,8 +233,15 @@ def status_for(exit_code: int) -> str:
 # =============================================================================
 
 
-def build_tables(raw_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Return (drivers, runs, report) from every *.csv in raw_dir."""
+def build_tables(
+    raw_dir: str, frozen_splits: dict[str, str] | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Return (drivers, runs, report) from every *.csv in raw_dir.
+
+    `frozen_splits` ({config_group: split}) from an earlier build keeps those
+    groups in their split; report["split_map"] holds the full mapping to save.
+    """
     files = sorted(glob.glob(os.path.join(raw_dir, "*.csv")))
     report = {"files": {}, "excluded_files": {}}
     frames = []
@@ -228,6 +261,14 @@ def build_tables(raw_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         raise ValueError(f"no usable CSV files in {raw_dir!r}")
     raw = pd.concat(frames, ignore_index=True)
 
+    # The same run copied into two files (e.g. "grid_x (1).csv") must count
+    # once: a run is identified by run_id + timestamp, a row by + driver_idx.
+    # Files are read in sorted order, so the first file's copy is kept.
+    dup = raw.duplicated(["run_id", "timestamp", "driver_idx"])
+    report["duplicate_rows_dropped"] = int(dup.sum())
+    report["files_with_duplicate_rows"] = sorted(raw.loc[dup, "file"].unique())
+    raw = raw[~dup].copy()
+
     # run_id alone repeats across batches; file + run_id + timestamp is unique.
     raw["run_key"] = raw["file"] + ":" + raw["run_id"] + "@" + raw["timestamp"].astype(str)
     raw["source"] = "local"
@@ -236,17 +277,16 @@ def build_tables(raw_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     raw["config_group"] = raw.apply(config_group, axis=1)
     raw["in_main_set"] = ~raw["experiment"].isin(SEPARATE_EXPERIMENTS)
     raw["stratum"] = raw["workload_type"] + "|" + raw["in_main_set"].astype(str)
-    raw["split"] = raw["config_group"].map(
-        stratified_split(raw[["config_group", "stratum"]].drop_duplicates())
-    )
+    split_map = assign_splits(raw[["config_group", "stratum"]].drop_duplicates(), frozen_splits)
+    raw["split"] = raw["config_group"].map(split_map)
+    frozen_splits = frozen_splits or {}
+    report["split_groups_kept_from_file"] = int(sum(g in frozen_splits for g in split_map))
+    report["split_groups_newly_assigned"] = int(sum(g not in frozen_splits for g in split_map))
+    report["split_map"] = split_map
     raw["status"] = raw["exit_code"].map(status_for)
     for stat in ("avg", "p95", "peak"):
         name = "mean" if stat == "avg" else stat
         raw[f"cpu_cores_{name}"] = raw[f"cpu_{stat}_pct"] / 100.0
-
-    dup = raw.duplicated(["run_key", "driver_idx"])
-    report["duplicate_rows_dropped"] = int(dup.sum())
-    raw = raw[~dup]
 
     drivers = raw[raw["role"] == "driver"].copy()
     report["root_rows_dropped"] = int((raw["role"] != "driver").sum())

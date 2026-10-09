@@ -39,3 +39,5 @@ venv/*
 .coverage
 results/benchmark/throttled/hybrid_ps_allreduce_w2/rankfile
 results/benchmark/*
+# Phase 6 frozen train/val/test split (configuration names only, no data)
+!config/phase6_splits.json
